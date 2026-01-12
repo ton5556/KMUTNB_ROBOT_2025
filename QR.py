@@ -2,6 +2,7 @@
 """
 ========================================
 Raspberry Pi 5 - QR Code Scanner
+Camera Module 3 Version
 สำหรับการแข่งขันหุ่นยนต์ขนส่งของอัตโนมัติ
 ========================================
 ใช้งาน: python3 qr_scanner.py
@@ -15,16 +16,15 @@ import serial.tools.list_ports
 import time
 import sys
 import numpy as np
+from picamera2 import Picamera2
 
 # ===== CONFIGURATION =====
 BAUD_RATE = 115200              # ความเร็ว Serial (ต้องตรงกับ Arduino)
-CAMERA_INDEX = 0                # หมายเลขกล้อง (0 = กล้องตัวแรก)
-RESEND_INTERVAL = 0.1        # ส่งคำสั่งซ้ำทุกๆ 0.5 วินาที
+RESEND_INTERVAL = 0.1           # ส่งคำสั่งซ้ำทุกๆ 0.1 วินาที
 FRAME_WIDTH = 640               # ความกว้างของภาพ
 FRAME_HEIGHT = 480              # ความสูงของภาพ
 
 # ===== QR CODE MAPPING =====
-# Dictionary สำหรับแปลงข้อมูล QR Code เป็นตำแหน่ง 1-8
 QR_MAPPING = {
     'POS_A_COL1': 1,
     'POS_A_COL2': 2,
@@ -34,27 +34,112 @@ QR_MAPPING = {
     'POS_C_COL2': 6,
     'POS_D_COL1': 7,
     'POS_D_COL2': 8,
-    # เพิ่ม Mapping ตามกติกาการแข่งขัน
     'STOP': 0,
     'HOME': 0
 }
 
 # ===== GLOBAL VARIABLES =====
-ser = None                      # Serial connection object
-last_sent_value = None          # ค่าที่ส่งล่าสุด
-last_send_time = 0              # เวลาที่ส่งล่าสุด
+ser = None
+last_sent_value = None
+last_send_time = 0
+picam2 = None
+
+# ===== CAMERA FUNCTIONS =====
+def init_picamera():
+    """
+    เริ่มต้น Pi Camera Module 3
+    Returns: Picamera2 object หรือ None
+    """
+    global picam2
+    
+    try:
+        print("📷 Initializing Camera Module 3...")
+        picam2 = Picamera2()
+        
+        # แสดงข้อมูลกล้อง
+        camera_properties = picam2.camera_properties
+        print(f"   Model: {camera_properties.get('Model', 'Unknown')}")
+        
+        # ตั้งค่า configuration สำหรับ Camera Module 3
+        # ใช้ main stream สำหรับ QR scanning
+        config = picam2.create_preview_configuration(
+            main={
+                "size": (FRAME_WIDTH, FRAME_HEIGHT),
+                "format": "RGB888"
+            },
+            controls={
+                "FrameRate": 30,
+                # ปิด autofocus สำหรับ QR scanning (ถ้ารองรับ)
+                "AfMode": 0,  # Manual focus
+            }
+        )
+        
+        picam2.configure(config)
+        
+        # เริ่มกล้อง
+        picam2.start()
+        
+        # รอให้กล้องเริ่มทำงานและ stabilize
+        print("   Warming up camera...")
+        time.sleep(2)
+        
+        # ทดสอบถ่ายภาพ
+        test_frame = picam2.capture_array()
+        if test_frame is not None:
+            print(f"✅ Camera Module 3 initialized successfully!")
+            print(f"   Resolution: {test_frame.shape[1]}x{test_frame.shape[0]}")
+            return picam2
+        else:
+            print("❌ Failed to capture test frame")
+            return None
+            
+    except Exception as e:
+        print(f"❌ Error initializing Camera Module 3: {e}")
+        print("\n   Troubleshooting:")
+        print("   1. Check camera cable connection")
+        print("   2. Enable camera: sudo raspi-config → Interface Options → Camera")
+        print("   3. Update system: sudo apt update && sudo apt upgrade")
+        print("   4. Test camera: libcamera-hello")
+        return None
+
+def read_frame():
+    """
+    อ่านภาพจาก Pi Camera
+    Returns: frame (numpy array) หรือ None
+    """
+    global picam2
+    
+    if picam2 is None:
+        return None
+    
+    try:
+        # Capture array จะได้ภาพในรูปแบบ RGB888
+        frame = picam2.capture_array()
+        return frame
+    except Exception as e:
+        print(f"❌ Error capturing frame: {e}")
+        return None
+
+def close_camera():
+    """ปิดกล้อง"""
+    global picam2
+    
+    if picam2 is not None:
+        try:
+            picam2.stop()
+            picam2.close()
+            print("✅ Camera closed")
+        except:
+            pass
 
 # ===== SERIAL PORT FUNCTIONS =====
 def find_arduino_port():
-    """
-    ค้นหา Serial Port ที่ Arduino เชื่อมต่ออยู่
-    Returns: port path หรือ None ถ้าหาไม่เจอ
-    """
+    """ค้นหา Serial Port ที่ Arduino เชื่อมต่ออยู่"""
     print("🔍 Searching for Arduino...")
     ports = serial.tools.list_ports.comports()
     
     for port in ports:
-        # ค้นหา Arduino โดยดูจาก description
+        # ใน Raspberry Pi มักจะเป็น /dev/ttyACM0 หรือ /dev/ttyUSB0
         if 'Arduino' in port.description or 'USB' in port.description or 'ACM' in port.device:
             print(f"✅ Found Arduino at: {port.device}")
             print(f"   Description: {port.description}")
@@ -63,33 +148,25 @@ def find_arduino_port():
     return None
 
 def connect_arduino(port_path=None, retry=3):
-    """
-    เชื่อมต่อกับ Arduino ผ่าน Serial
-    Args:
-        port_path: path ของ serial port (ถ้าไม่ระบุจะค้นหาอัตโนมัติ)
-        retry: จำนวนครั้งที่ลองใหม่
-    Returns: serial object หรือ None
-    """
+    """เชื่อมต่อกับ Arduino ผ่าน Serial"""
     global ser
     
-    # ถ้าไม่ระบุ port ให้ค้นหาเอง
     if port_path is None:
         port_path = find_arduino_port()
     
     if port_path is None:
         print("❌ ERROR: Arduino not found!")
-        print("   Please check:")
-        print("   1. Arduino is connected via USB")
-        print("   2. USB cable supports data transfer")
-        print("   3. Arduino is powered on")
+        print("   Available ports:")
+        ports = serial.tools.list_ports.comports()
+        for port in ports:
+            print(f"   - {port.device}: {port.description}")
         return None
     
-    # พยายามเชื่อมต่อ
     for attempt in range(retry):
         try:
             print(f"🔌 Connecting to {port_path}... (Attempt {attempt + 1}/{retry})")
             ser = serial.Serial(port_path, BAUD_RATE, timeout=1)
-            time.sleep(2)  # รอให้ Arduino reset และพร้อมใช้งาน
+            time.sleep(2)  # รอให้ Arduino reset
             print("✅ Connected to Arduino successfully!")
             return ser
         except serial.SerialException as e:
@@ -103,19 +180,13 @@ def connect_arduino(port_path=None, retry=3):
     return None
 
 def send_to_arduino(value):
-    """
-    ส่งข้อมูลไปยัง Arduino
-    Args:
-        value: ตัวเลข 0-8 ที่จะส่ง
-    """
+    """ส่งข้อมูลไปยัง Arduino"""
     global ser, last_sent_value, last_send_time
     
     if ser is None or not ser.is_open:
-        print("❌ Serial not connected!")
         return False
     
     try:
-        # แปลง int เป็น string แล้วส่ง
         command = str(value)
         ser.write(command.encode())
         
@@ -131,31 +202,17 @@ def send_to_arduino(value):
 
 # ===== QR CODE PROCESSING =====
 def decode_qr_code(frame):
-    """
-    อ่านและ Decode QR Code จากภาพ
-    Args:
-        frame: ภาพจากกล้อง (numpy array)
-    Returns: list ของ decoded QR codes
-    """
-    # ใช้ pyzbar ในการ decode
+    """อ่านและ Decode QR Code จากภาพ"""
     decoded_objects = pyzbar.decode(frame)
     return decoded_objects
 
 def map_qr_to_destination(qr_data):
-    """
-    แปลงข้อมูล QR Code เป็นตำแหน่งปลายทาง (1-8)
-    Args:
-        qr_data: ข้อมูลที่อ่านได้จาก QR Code (string)
-    Returns: ตัวเลข 0-8 หรือ None ถ้าไม่พบใน mapping
-    """
-    # ลบช่องว่างและแปลงเป็นตัวพิมพ์ใหญ่
+    """แปลงข้อมูล QR Code เป็นตำแหน่งปลายทาง (0-8)"""
     qr_data = qr_data.strip().upper()
     
-    # ค้นหาใน mapping dictionary
     if qr_data in QR_MAPPING:
         return QR_MAPPING[qr_data]
     
-    # ถ้าข้อมูลเป็นตัวเลข 1-8 โดยตรง
     try:
         value = int(qr_data)
         if 0 <= value <= 8:
@@ -166,20 +223,12 @@ def map_qr_to_destination(qr_data):
     return None
 
 def draw_qr_info(frame, decoded_objects):
-    """
-    วาดกรอบและข้อความบน QR Code ที่พบ
-    Args:
-        frame: ภาพจากกล้อง
-        decoded_objects: list ของ QR codes ที่ decode แล้ว
-    Returns: frame ที่วาดข้อมูลแล้ว, destination value
-    """
+    """วาดกรอบและข้อความบน QR Code ที่พบ"""
     destination = None
     
     for obj in decoded_objects:
-        # ดึงข้อมูลตำแหน่งของ QR Code
         points = obj.polygon
         
-        # ถ้ามี polygon ไม่ครบ ให้ใช้ rect แทน
         if len(points) > 4:
             hull = cv2.convexHull(np.array([point for point in points], dtype=np.float32))
             points = hull
@@ -191,20 +240,15 @@ def draw_qr_info(frame, decoded_objects):
         
         # ดึงข้อมูลจาก QR Code
         qr_data = obj.data.decode('utf-8')
-        qr_type = obj.type
-        
-        # แปลงเป็นตำแหน่งปลายทาง
         destination = map_qr_to_destination(qr_data)
         
         # แสดงข้อความบน QR Code
         x = points[0][0]
         y = points[0][1] - 10
         
-        # แสดงข้อมูล QR
         cv2.putText(frame, f"Data: {qr_data}", (x, y), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # แสดงตำแหน่งที่แปลงแล้ว
         if destination is not None:
             cv2.putText(frame, f"Destination: {destination}", (x, y - 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
@@ -216,52 +260,56 @@ def draw_qr_info(frame, decoded_objects):
 
 # ===== MAIN PROGRAM =====
 def main():
-    """
-    โปรแกรมหลัก
-    """
-    global ser, last_sent_value, last_send_time
+    """โปรแกรมหลัก"""
+    global ser, last_sent_value, last_send_time, picam2
     
-    print("=" * 50)
-    print("  Raspberry Pi QR Code Scanner")
+    print("=" * 60)
+    print("  Raspberry Pi 5 - QR Code Scanner")
+    print("  Camera Module 3")
     print("  Robot Control System")
-    print("=" * 50)
+    print("=" * 60)
     
     # เชื่อมต่อ Arduino
     ser = connect_arduino()
     if ser is None:
         print("\n⚠️  Running without Arduino connection (Preview mode)")
-        print("   Connect Arduino and restart to enable control")
+        print("   You can still test QR scanning")
     
     # เปิดกล้อง
-    print(f"\n📷 Opening camera {CAMERA_INDEX}...")
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    print()
+    picam2 = init_picamera()
     
-    if not cap.isOpened():
-        print("❌ ERROR: Cannot open camera!")
-        print("   Please check:")
-        print("   1. Camera is connected properly")
-        print("   2. Camera permissions are granted")
-        print("   3. No other program is using the camera")
+    if picam2 is None:
+        print("\n❌ ERROR: Cannot initialize Camera Module 3!")
         sys.exit(1)
     
-    # ตั้งค่าความละเอียดของกล้อง
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-    
-    print("✅ Camera opened successfully!")
-    print("\n" + "=" * 50)
-    print("  Press 'q' to quit")
-    print("=" * 50 + "\n")
+    print("\n" + "=" * 60)
+    print("  System Ready!")
+    print("  Press 'q' in the preview window to quit")
+    print("=" * 60 + "\n")
     
     # Main loop
+    frame_count = 0
+    fps_start_time = time.time()
+    fps = 0
+    
     try:
         while True:
             # อ่านภาพจากกล้อง
-            ret, frame = cap.read()
+            frame = read_frame()
             
-            if not ret:
+            if frame is None:
                 print("❌ Failed to read frame from camera")
-                break
+                time.sleep(0.1)
+                continue
+            
+            frame_count += 1
+            
+            # คำนวณ FPS ทุกๆ 30 frames
+            if frame_count % 30 == 0:
+                fps_end_time = time.time()
+                fps = 30 / (fps_end_time - fps_start_time)
+                fps_start_time = fps_end_time
             
             # Decode QR Code
             decoded_objects = decode_qr_code(frame)
@@ -273,24 +321,37 @@ def main():
             current_time = time.time()
             
             if destination is not None:
-                # ส่งใหม่ถ้าค่าเปลี่ยน หรือเวลาผ่านไป RESEND_INTERVAL
                 if (destination != last_sent_value or 
                     current_time - last_send_time >= RESEND_INTERVAL):
                     send_to_arduino(destination)
             
             # แสดงสถานะบนหน้าจอ
+            # Background สำหรับข้อความ
+            cv2.rectangle(frame, (0, 0), (400, 120), (0, 0, 0), -1)
+            
+            # แสดงค่าที่ส่งล่าสุด
             status_text = f"Last Sent: {last_sent_value if last_sent_value is not None else 'None'}"
             cv2.putText(frame, status_text, (10, 30), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
-            # แสดงสถานะการเชื่อมต่อ
+            # แสดงสถานะการเชื่อมต่อ Arduino
             connection_status = "Arduino: Connected" if (ser and ser.is_open) else "Arduino: Disconnected"
             connection_color = (0, 255, 0) if (ser and ser.is_open) else (0, 0, 255)
             cv2.putText(frame, connection_status, (10, 60), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, connection_color, 2)
             
+            # แสดง FPS
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 90), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            
+            # แสดง QR Count
+            qr_count = len(decoded_objects)
+            if qr_count > 0:
+                cv2.putText(frame, f"QR Codes: {qr_count}", (10, 115), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
             # แสดงภาพ
-            cv2.imshow('QR Code Scanner - Press Q to quit', frame)
+            cv2.imshow('Camera Module 3 - QR Scanner (Press Q to quit)', frame)
             
             # ตรวจสอบการกดปุ่ม
             key = cv2.waitKey(1) & 0xFF
@@ -299,23 +360,32 @@ def main():
                 break
     
     except KeyboardInterrupt:
-        print("\n\n⚠️  Program interrupted by user")
+        print("\n\n⚠️  Program interrupted by user (Ctrl+C)")
+    
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
     
     finally:
-        # ปิดการเชื่อมต่อ
-        print("🧹 Cleaning up...")
+        print("\n🧹 Cleaning up...")
         
         # ส่งคำสั่งหยุดก่อนปิด
         if ser and ser.is_open:
+            print("   Sending STOP command to Arduino...")
             send_to_arduino(0)
             time.sleep(0.5)
             ser.close()
             print("✅ Serial connection closed")
         
-        cap.release()
+        # ปิดกล้อง
+        close_camera()
+        
+        # ปิด OpenCV windows
         cv2.destroyAllWindows()
-        print("✅ Camera released")
-        print("\n👋 Program ended successfully")
+        
+        print("✅ Program ended successfully")
+        print("\n" + "=" * 60)
 
 # ===== ENTRY POINT =====
 if __name__ == "__main__":
